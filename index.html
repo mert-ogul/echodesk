@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EchoDesk</title>
+<style>
+:root { --ink:#1b1b1b; --muted:#6b6b6b; --rule:#dcdcdc; --alert:#c8361b; }
+* { box-sizing:border-box; }
+html { background:#fff; }
+body { margin:0; color:var(--ink); font:15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+main { max-width:980px; margin:0 auto; padding:20px 24px 32px; }
+header { display:flex; justify-content:space-between; align-items:baseline; gap:16px; padding-bottom:10px; border-bottom:1px solid var(--ink); }
+h1 { font-size:17px; font-weight:650; margin:0; }
+#mode { margin:0; color:var(--muted); text-align:right; }
+.readout { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(0,1fr); gap:28px; align-items:end; padding:22px 0 6px; }
+#what { margin:0; color:var(--muted); font-size:14px; }
+#distance { margin:4px 0 0; font-size:clamp(64px,11vw,112px); line-height:1; font-weight:600; letter-spacing:-0.03em; font-variant-numeric:tabular-nums; white-space:nowrap; }
+#distance.none { color:#cfcfcf; }
+#distance small { font-size:.3em; font-weight:500; letter-spacing:0; margin-left:.15em; }
+#status { margin:0 0 2px; font-weight:650; }
+#status.bad { color:var(--alert); }
+#message { margin:0 0 10px; min-height:2.9em; }
+.small { margin:2px 0; font-size:13px; color:var(--muted); }
+canvas { display:block; width:100%; }
+#track { height:84px; margin-top:16px; }
+h2 { margin:26px 0 4px; font-size:14px; font-weight:650; }
+.row { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:baseline; gap:6px 20px; }
+.row label { font-size:13px; color:var(--muted); margin-left:12px; }
+select { font:inherit; font-size:13px; padding:1px 4px; border:1px solid #9a9a9a; border-radius:2px; background:#fff; color:var(--ink); }
+input[type=checkbox] { accent-color:var(--ink); vertical-align:-2px; margin:0 4px 0 0; }
+#echo { height:240px; margin-top:6px; }
+footer { margin-top:22px; padding-top:10px; border-top:1px solid var(--rule); }
+@media (max-width:640px) {
+  main { padding:14px 16px 24px; }
+  .readout { grid-template-columns:1fr; gap:12px; padding-top:16px; }
+  .row label { margin:0 12px 0 0; }
+  #echo { height:200px; }
+}
+</style>
+</head>
+<body>
+<main>
+<header><h1>EchoDesk</h1><p id="mode">Connecting</p></header>
+<section class="readout" aria-label="Current reading">
+  <div><p id="what">Distance from sound</p><div id="distance" class="none" aria-live="polite">--.-</div></div>
+  <div>
+    <p id="status" role="status">Connecting</p>
+    <p id="message">Waiting for the Pi.</p>
+    <p class="small" id="counts"></p>
+    <p class="small" id="quality"></p>
+    <p class="small" id="age"></p>
+  </div>
+</section>
+<canvas id="track" role="img" aria-label="Reading on the 10 to 75 cm range"></canvas>
+<p class="small" id="track-note"></p>
+<h2>Echo</h2>
+<div class="row">
+  <p class="small">What the microphone hears after the main peak, log scale. Delay here is not distance.</p>
+  <div><label>Scale <select id="scale"><option value="1">0–1</option><option value="2" selected>0–2</option><option value="5">0–5</option></select></label><label><input id="baseline" type="checkbox">Empty desk</label></div>
+</div>
+<canvas id="echo" role="img" aria-label="Echo response against delay"></canvas>
+<footer><p class="small" id="evaluation"></p></footer>
+</main>
+<script>
+const $ = selector => document.querySelector(selector);
+const distance = $('#distance'), statusLine = $('#status'), message = $('#message');
+const scale = $('#scale'), baseline = $('#baseline');
+const LO = 10, HI = 75, STALE_S = 5;
+let current = null, lastSequence = null, sequenceChangedAt = performance.now();
+
+function setup(canvas) {
+    const width = canvas.clientWidth, height = canvas.clientHeight, ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+    const g = canvas.getContext('2d');
+    g.setTransform(ratio, 0, 0, ratio, 0, 0);
+    g.clearRect(0, 0, width, height);
+    g.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif';
+    return [g, width, height];
+}
+
+function drawTrack() {
+    const [g, width, height] = setup($('#track'));
+    const left = 14, right = 22, axis = height - 26, w = width - left - right;
+    const x = cm => left + (cm - LO) / (HI - LO) * w;
+    if (current && current.mode === 'collect' && Array.isArray(current.coverage)) {
+        current.coverage.forEach((count, i) => {
+            g.fillStyle = count ? '#9d9d9d' : '#efefef';
+            const h = count ? 6 + Math.min(count, 4) / 4 * 28 : 4;
+            g.fillRect(x(LO + i) + 0.5, axis - h, Math.max(w / 65 - 1, 1), h);
+        });
+    }
+    g.fillStyle = '#1b1b1b';
+    g.fillRect(left, axis, w, 1);
+    for (let cm = LO; cm <= HI; cm += 1) {
+        const major = cm % 10 === 0 || cm === HI, mid = cm % 5 === 0;
+        if (!major && !mid && w < 500) continue;
+        g.fillRect(Math.round(x(cm)), axis, 1, major ? 9 : mid ? 6 : 3);
+        if (major && !(cm === 70 && w < 500)) {
+            g.fillStyle = '#6b6b6b'; g.textAlign = 'center';
+            g.fillText(cm === HI ? '75 cm' : String(cm), x(cm), axis + 22);
+            g.fillStyle = '#1b1b1b';
+        }
+    }
+    const value = current && (current.mode === 'collect' ? current.lidar_m : current.distance_m);
+    if (Number.isFinite(value)) {
+        const px = x(Math.min(Math.max(value * 100, LO), HI));
+        g.fillRect(Math.round(px) - 1, 6, 2, axis - 6);
+        g.beginPath(); g.moveTo(px - 6, 2); g.lineTo(px + 6, 2); g.lineTo(px, 10); g.fill();
+    }
+}
+
+function drawEcho() {
+    const [g, width, height] = setup($('#echo'));
+    const left = 40, right = 10, top = 10, bottom = 40, w = width - left - right, h = height - top - bottom;
+    const maximum = Number(scale.value), x = ms => left + (ms - 0.25) / 11.75 * w;
+    g.fillStyle = '#6b6b6b'; g.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = Math.round(top + h * i / 4) + 0.5;
+        g.strokeStyle = i === 4 ? '#1b1b1b' : '#e6e6e6';
+        g.beginPath(); g.moveTo(left, y); g.lineTo(left + w, y); g.stroke();
+        g.textAlign = 'right'; g.fillText((maximum * (1 - i / 4)).toFixed(1), left - 8, y + 4);
+    }
+    g.textAlign = 'center';
+    for (const ms of [1, 3, 5, 7, 9, 12]) g.fillText(String(ms), x(ms), top + h + 18);
+    g.fillText('ms after the main peak', left + w / 2, height - 4);
+    function line(values, color, dash) {
+        if (!Array.isArray(values) || values.length < 2) return;
+        g.save(); g.beginPath(); g.rect(left, top, w, h); g.clip();
+        g.strokeStyle = color; g.lineWidth = 1.6; g.setLineDash(dash); g.beginPath();
+        values.forEach((v, i) => {
+            const px = left + i / (values.length - 1) * w, py = top + h - v / maximum * h;
+            if (i === 0) g.moveTo(px, py); else g.lineTo(px, py);
+        });
+        g.stroke(); g.restore();
+    }
+    if (!current) return;
+    if (baseline.checked) line(current.baseline_profile, '#9d9d9d', [5, 4]);
+    line(current.profile, '#1b1b1b', []);
+    const over = values => (values || []).some(v => v > maximum);
+    if (over(current.profile) || (baseline.checked && over(current.baseline_profile))) {
+        g.fillStyle = '#c8361b'; g.textAlign = 'left';
+        g.fillText('Goes above this scale. Pick a bigger one.', left + 8, top + 16);
+    }
+}
+
+function draw() { drawTrack(); drawEcho(); }
+
+function showNumber(metres) {
+    distance.textContent = '--.-';
+    distance.className = 'none';
+    if (!Number.isFinite(metres)) return;
+    distance.textContent = (metres * 100).toFixed(1);
+    distance.className = '';
+    const unit = document.createElement('small'); unit.textContent = 'cm'; distance.appendChild(unit);
+}
+
+const LABELS = {
+    starting: 'Starting', measuring: 'Measuring', echo_only: 'Echo only',
+    saved: 'Saved', skipped: 'Not saved', signal_error: 'Signal problem',
+};
+
+function unavailable(kind, text) {
+    showNumber(null);
+    statusLine.textContent = kind === 'stale' ? 'No new reading' : 'Disconnected';
+    statusLine.className = 'bad'; message.textContent = text;
+    $('#quality').textContent = ''; current = null; draw();
+}
+
+function show(data) {
+    current = data;
+    const collecting = data.mode === 'collect';
+    $('#mode').textContent = collecting ? 'Recording ' + data.run + ' with LiDAR' : 'Sound only';
+    $('#what').textContent = collecting ? 'LiDAR distance' : 'Distance from sound';
+    statusLine.textContent = LABELS[data.status] || data.status;
+    statusLine.className = data.status === 'signal_error' ? 'bad' : '';
+    message.textContent = data.message;
+    showNumber(collecting ? data.lidar_m : (data.status === 'measuring' ? data.distance_m : null));
+    $('#counts').textContent = collecting ? data.saved + ' saved · ' + data.skipped + ' skipped' : '';
+    $('#quality').textContent = data.quality ? 'Peak ' + (data.quality.peak * 100).toFixed(2) + '% of full scale · chirp/noise ' + data.quality.chirp_ratio.toFixed(1) : '';
+    $('#age').textContent = 'Reading ' + data.sequence + ' · ' + Number(data.age_s).toFixed(1) + ' s ago';
+    $('#track-note').textContent = collecting ? 'Grey bars: samples per centimetre in this run. Fill the gaps, then press Ctrl+C on the Pi.' : '';
+    const e = data.evaluation;
+    $('#evaluation').textContent = collecting ? 'Keep your hands out of the LiDAR\'s view while it chirps.'
+        : e ? 'Held-out ' + e.test_run + ': ' + e.test_mae_cm.toFixed(2) + ' cm mean error against the LiDAR over ' + e.test_samples + ' samples. Always guessing the median: ' + e.median_guess_mae_cm.toFixed(2) + ' cm.' + (e.k === 1 ? ' With k = 1 each reading is one of the training distances.' : '')
+        : 'No test result yet. Run train first.';
+    draw();
+}
+
+async function poll() {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    try {
+        const response = await fetch('/state.json', {cache: 'no-store', signal: controller.signal});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        if (data.sequence !== lastSequence) { lastSequence = data.sequence; sequenceChangedAt = performance.now(); }
+        if (data.age_s > STALE_S || performance.now() - sequenceChangedAt > STALE_S * 1000) {
+            unavailable('stale', 'Nothing new from the Pi for ' + STALE_S + ' seconds. Check its terminal.');
+            $('#age').textContent = '';
+        } else show(data);
+    } catch (error) {
+        unavailable('disconnected', "Can't reach the Pi. Is the program running and the SSH tunnel open?");
+        $('#age').textContent = '';
+    } finally { clearTimeout(timeout); setTimeout(poll, 300); }
+}
+
+scale.addEventListener('change', draw);
+baseline.addEventListener('change', draw);
+window.addEventListener('resize', draw);
+draw(); poll();
+</script>
+</body>
+</html>
